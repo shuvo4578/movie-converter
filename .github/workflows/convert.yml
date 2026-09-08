@@ -20,51 +20,51 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # 6 hours max
+    timeout-minutes: 60
     
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
       
-      - name: 🔧 Install aria2
+      - name: 🔧 Install aria2 & jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2
-          aria2c --version
+          sudo apt-get install -y aria2 jq curl
       
       - name: 📊 Display inputs
         run: |
           echo "🎬 Title: ${{ inputs.title }}"
           echo "📺 Quality: ${{ inputs.quality }}"
-          echo "🧲 Magnet: ${MAGNET:0:80}..."
-        env:
-          MAGNET: ${{ inputs.magnet }}
       
-      - name: ⬇️ Download torrent via aria2
+      - name: ⬇️ Download torrent via aria2 (High Speed)
         id: download
         run: |
           set -e
-          
-          # Create download directory
           mkdir -p downloads
           cd downloads
           
-          # Download with aria2
-          echo "🚀 Starting download..."
+          echo "🚀 Starting High-Speed Download..."
           aria2c \
             --seed-time=0 \
-            --max-overall-download-limit=10M \
-            --bt-max-peers=50 \
-            --bt-request-peer-speed-limit=1M \
+            --max-overall-download-limit=0 \
+            --max-download-limit=0 \
+            --split=16 \
+            --max-connection-per-server=16 \
+            --min-split-size=1M \
+            --bt-max-peers=100 \
             --enable-dht=true \
             --bt-enable-lpd=true \
             --follow-torrent=mem \
             --file-allocation=none \
-            --summary-interval=30 \
+            --summary-interval=10 \
+            --timeout=120 \
             "${{ inputs.magnet }}"
           
-          # Find the largest file (movie file)
-          LARGEST_FILE=$(find . -type f -exec ls -lh {} + | sort -k5 -hr | head -1 | awk '{print $NF}')
+          # Find the largest media file
+          LARGEST_FILE=$(find . -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" \) | head -1)
+          if [ -z "$LARGEST_FILE" ]; then
+            LARGEST_FILE=$(find . -type f -exec ls -lh {} + | sort -k5 -hr | head -1 | awk '{print $NF}')
+          fi
           
           if [ -z "$LARGEST_FILE" ]; then
             echo "❌ No file downloaded"
@@ -75,59 +75,42 @@ jobs:
           FILE_SIZE=$(du -h "$LARGEST_FILE" | cut -f1)
           echo "📦 Size: $FILE_SIZE"
           
-          # Save filename for next step
-          echo "filename=$LARGEST_FILE" >> $GITHUB_OUTPUT
+          echo "filepath=$LARGEST_FILE" >> $GITHUB_OUTPUT
           echo "filesize=$FILE_SIZE" >> $GITHUB_OUTPUT
       
-      - name: 🚀 Upload to file hosting
+      - name: 🚀 Upload to Direct Cloud Hosting
         id: upload
         run: |
           set -e
           cd downloads
-          FILE="${{ steps.download.outputs.filename }}"
+          FILE="${{ steps.download.outputs.filepath }}"
           
-          echo "📤 Uploading to file.io..."
+          echo "📤 Uploading to tmpfiles.org..."
+          RESP=$(curl -s -F "file=@$FILE" https://tmpfiles.org/api/v1/upload || true)
+          URL=$(echo "$RESP" | jq -r '.data.url // empty' || true)
           
-          # Upload to file.io (expires after 1 download by default)
-          # We'll use max expiry (14 days) and unlimited downloads
-          RESPONSE=$(curl -F "file=@$FILE" \
-            -F "expires=14d" \
-            -F "maxDownloads=" \
-            https://file.io 2>/dev/null)
-          
-          echo "Response: $RESPONSE"
-          
-          # Extract URL using grep/sed (no jq needed)
-          DIRECT_URL=$(echo "$RESPONSE" | grep -o '"link":"[^"]*"' | sed 's/"link":"//;s/"$//')
+          if [ -n "$URL" ]; then
+            # Convert view url to direct download url: https://tmpfiles.org/12345/abc.mkv -> https://tmpfiles.org/dl/12345/abc.mkv
+            DIRECT_URL=$(echo "$URL" | sed 's/tmpfiles.org\//tmpfiles.org\/dl\//')
+            echo "✅ tmpfiles URL: $DIRECT_URL"
+          else
+            echo "⚠️ tmpfiles failed, uploading to file.io..."
+            FIO_RESP=$(curl -s -F "file=@$FILE" https://file.io || true)
+            DIRECT_URL=$(echo "$FIO_RESP" | jq -r '.link // empty' || true)
+          fi
           
           if [ -z "$DIRECT_URL" ]; then
-            echo "❌ Upload failed"
+            echo "❌ All uploads failed"
             exit 1
           fi
           
-          echo "✅ Upload complete!"
-          echo "🔗 Direct URL: $DIRECT_URL"
-          
-          # Save URL for output
           echo "direct_url=$DIRECT_URL" >> $GITHUB_OUTPUT
-      
-      - name: 🧹 Cleanup
-        if: always()
-        run: |
-          echo "🧹 Cleaning up workspace..."
-          cd $GITHUB_WORKSPACE
-          rm -rf downloads/*
-          df -h
-          echo "✅ Cleanup complete"
+          echo "🔗 Final Direct URL: $DIRECT_URL"
       
       - name: 📋 Summary
         if: success()
         run: |
           echo "## ✅ Conversion Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "**🎬 Movie:** ${{ inputs.title }}" >> $GITHUB_STEP_SUMMARY
-          echo "**📺 Quality:** ${{ inputs.quality }}" >> $GITHUB_STEP_SUMMARY
           echo "**📦 File Size:** ${{ steps.download.outputs.filesize }}" >> $GITHUB_STEP_SUMMARY
-          echo "**🔗 Direct URL:** ${{ steps.upload.outputs.direct_url }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**⏱️ Total Time:** ${{ github.event.workflow_run.updated_at }}" >> $GITHUB_STEP_SUMMARY
+          echo "**🔗 Direct HTTP Link:** ${{ steps.upload.outputs.direct_url }}" >> $GITHUB_STEP_SUMMARY
