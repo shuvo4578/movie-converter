@@ -12,7 +12,7 @@ on:
         required: true
         type: string
       quality:
-        description: 'Quality (720p/1080p/2160p)'
+        description: 'Quality (720p/1080p)'
         required: false
         type: string
         default: '1080p'
@@ -26,10 +26,10 @@ jobs:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
       
-      - name: 🔧 Install aria2 & jq
+      - name: 🔧 Install aria2 & python3
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 jq curl
+          sudo apt-get install -y aria2 python3 curl
       
       - name: 📊 Display inputs
         run: |
@@ -81,31 +81,74 @@ jobs:
       - name: 🚀 Upload to Direct Cloud Hosting
         id: upload
         run: |
-          set -e
           cd downloads
           FILE="${{ steps.download.outputs.filepath }}"
           
-          echo "📤 Uploading to tmpfiles.org..."
-          RESP=$(curl -s -F "file=@$FILE" https://tmpfiles.org/api/v1/upload || true)
-          URL=$(echo "$RESP" | jq -r '.data.url // empty' || true)
+          python3 - << 'EOF'
+          import os, sys, json, urllib.request, subprocess
+
+          filepath = os.environ.get("FILE", "").strip()
+          if filepath.startswith("./"):
+              filepath = filepath[2:]
           
-          if [ -n "$URL" ]; then
-            # Convert view url to direct download url: https://tmpfiles.org/12345/abc.mkv -> https://tmpfiles.org/dl/12345/abc.mkv
-            DIRECT_URL=$(echo "$URL" | sed 's/tmpfiles.org\//tmpfiles.org\/dl\//')
-            echo "✅ tmpfiles URL: $DIRECT_URL"
-          else
-            echo "⚠️ tmpfiles failed, uploading to file.io..."
-            FIO_RESP=$(curl -s -F "file=@$FILE" https://file.io || true)
-            DIRECT_URL=$(echo "$FIO_RESP" | jq -r '.link // empty' || true)
-          fi
-          
-          if [ -z "$DIRECT_URL" ]; then
-            echo "❌ All uploads failed"
-            exit 1
-          fi
-          
-          echo "direct_url=$DIRECT_URL" >> $GITHUB_OUTPUT
-          echo "🔗 Final Direct URL: $DIRECT_URL"
+          print(f"Uploading file: {filepath}")
+          direct_url = ""
+
+          # 1. Try Pixeldrain (supports up to 10GB)
+          try:
+              print("Trying Pixeldrain...")
+              cmd = ["curl", "-s", "-X", "PUT", "--upload-file", filepath, f"https://pixeldrain.com/api/file/{os.path.basename(filepath)}"]
+              res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+              data = json.loads(res.stdout)
+              if data.get("success"):
+                  file_id = data["id"]
+                  direct_url = f"https://pixeldrain.com/api/file/{file_id}"
+                  print(f"✅ Pixeldrain Direct Link: {direct_url}")
+          except Exception as e:
+              print(f"Pixeldrain failed: {e}")
+
+          # 2. Try Gofile if Pixeldrain failed
+          if not direct_url:
+              try:
+                  print("Trying Gofile...")
+                  srv_req = urllib.request.Request("https://api.gofile.io/servers", headers={"User-Agent": "Mozilla/5.0"})
+                  with urllib.request.urlopen(srv_req, timeout=10) as srv_resp:
+                      srv_data = json.loads(srv_resp.read().decode())
+                      server = srv_data["data"]["servers"][0]["name"]
+                  
+                  upload_url = f"https://{server}.gofile.io/contents/uploadfile"
+                  cmd = ["curl", "-s", "-F", f"file=@{filepath}", upload_url]
+                  res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  g_data = json.loads(res.stdout)
+                  if g_data.get("status") == "ok":
+                      direct_url = g_data["data"]["downloadPage"]
+                      print(f"✅ Gofile Link: {direct_url}")
+              except Exception as e:
+                  print(f"Gofile failed: {e}")
+
+          # 3. Try Bashupload as fallback (50GB limit)
+          if not direct_url:
+              try:
+                  print("Trying Bashupload...")
+                  cmd = ["curl", "-s", "https://bashupload.com", "-T", filepath]
+                  res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                  for line in res.stdout.splitlines():
+                      if "http" in line:
+                          direct_url = line.strip()
+                          print(f"✅ Bashupload Link: {direct_url}")
+                          break
+              except Exception as e:
+                  print(f"Bashupload failed: {e}")
+
+          if not direct_url:
+              print("❌ All uploaders failed!")
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"direct_url={direct_url}\n")
+          EOF
+        env:
+          FILE: ${{ steps.download.outputs.filepath }}
       
       - name: 📋 Summary
         if: success()
