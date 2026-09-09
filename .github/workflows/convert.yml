@@ -41,7 +41,7 @@ jobs:
       - name: 🔧 Install aria2 & gh CLI
         run: |
           sudo apt-get update
-          sudo apt-get install -y aria2 curl
+          sudo apt-get install -y aria2 curl python3
       
       - name: 📊 Display inputs
         run: |
@@ -55,7 +55,7 @@ jobs:
           mkdir -p downloads
           cd downloads
           
-          echo "🚀 Starting High-Speed Download..."
+          echo "🚀 Starting High-Speed Torrent Download..."
           aria2c \
             --seed-time=0 \
             --max-overall-download-limit=0 \
@@ -69,33 +69,51 @@ jobs:
             --follow-torrent=mem \
             --file-allocation=none \
             --summary-interval=10 \
+            --bt-stop-timeout=300 \
             --timeout=120 \
             "${{ inputs.magnet }}"
           
-          # Find the largest media file
-          LARGEST_FILE=$(find . -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.avi" \) | head -1)
-          if [ -z "$LARGEST_FILE" ]; then
-            LARGEST_FILE=$(find . -type f -exec ls -lh {} + | sort -k5 -hr | head -1 | awk '{print $NF}')
-          fi
+          # Use Python to accurately locate largest video file and rename it
+          python3 - << 'PYEOF'
+          import os, sys, shutil
+
+          videos = []
+          for root, dirs, files in os.walk("."):
+              for f in files:
+                  ext = os.path.splitext(f)[1].lower()
+                  if ext in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".m4v"]:
+                      full_path = os.path.join(root, f)
+                      try:
+                          sz = os.path.getsize(full_path)
+                          if sz > 10 * 1024 * 1024:  # At least 10 MB
+                              videos.append((sz, full_path, f))
+                      except OSError:
+                          pass
+
+          if not videos:
+              print("❌ No video media file found in torrent download!")
+              sys.exit(1)
+
+          videos.sort(key=lambda x: x[0], reverse=True)
+          largest_size, largest_path, orig_name = videos[0]
+
+          # Clean filename
+          clean_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in orig_name)
+          dest_path = os.path.abspath(clean_name)
           
-          if [ -z "$LARGEST_FILE" ]; then
-            echo "❌ No file downloaded"
-            exit 1
-          fi
-          
-          echo "✅ Downloaded: $LARGEST_FILE"
-          FILE_SIZE=$(du -h "$LARGEST_FILE" | cut -f1)
-          echo "📦 Size: $FILE_SIZE"
-          
-          # Clean file name
-          CLEAN_NAME=$(basename "$LARGEST_FILE" | tr ' ' '_' | tr -cd '[:alnum:]_.-')
-          if [ "$LARGEST_FILE" != "./$CLEAN_NAME" ]; then
-            mv "$LARGEST_FILE" "./$CLEAN_NAME"
-          fi
-          
-          echo "filepath=downloads/$CLEAN_NAME" >> $GITHUB_OUTPUT
-          echo "filename=$CLEAN_NAME" >> $GITHUB_OUTPUT
-          echo "filesize=$FILE_SIZE" >> $GITHUB_OUTPUT
+          if os.path.abspath(largest_path) != dest_path:
+              shutil.move(largest_path, dest_path)
+
+          size_human = f"{largest_size / (1024*1024):.1f} MB" if largest_size < 1024*1024*1024 else f"{largest_size / (1024*1024*1024):.2f} GB"
+          print(f"✅ Downloaded Video: {clean_name} ({size_human})")
+
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+          if gh_out:
+              with open(gh_out, "a") as f:
+                  f.write(f"filepath=downloads/{clean_name}\n")
+                  f.write(f"filename={clean_name}\n")
+                  f.write(f"filesize={size_human}\n")
+          PYEOF
       
       - name: 📦 Create GitHub Release & Upload Asset
         id: release
@@ -106,7 +124,7 @@ jobs:
           FILEPATH="${{ steps.download.outputs.filepath }}"
           FILENAME="${{ steps.download.outputs.filename }}"
           
-          echo "Creating temporary release $TAG_NAME..."
+          echo "Creating temporary release $TAG_NAME with asset $FILEPATH..."
           gh release create "$TAG_NAME" "$FILEPATH" \
             --title "Temp Release $TAG_NAME" \
             --notes "Temporary movie asset for remote upload pipeline"
