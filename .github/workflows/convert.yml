@@ -12,21 +12,22 @@ on:
         required: true
         type: string
       quality:
-        description: 'Quality (720p/1080p)'
+        description: 'Quality (1080p or 720p)'
         required: false
-        type: string
         default: '1080p'
+        type: string
       token:
-        description: 'GitHub token for release upload'
+        description: 'GitHub Personal Access Token'
         required: false
         type: string
 
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     permissions:
       contents: write
+      actions: write
     
     steps:
       - name: 📥 Checkout repository
@@ -37,11 +38,13 @@ jobs:
           if [ -n "${{ inputs.token }}" ]; then
             echo "::add-mask::${{ inputs.token }}"
           fi
-      
-      - name: 🔧 Install aria2 & gh CLI
+
+      - name: 🔧 Install aria2, gh CLI & cloudflared
         run: |
-          sudo apt-get update
-          sudo apt-get install -y aria2 curl python3
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq aria2 curl python3
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
       
       - name: 📊 Display inputs
         run: |
@@ -55,25 +58,34 @@ jobs:
           mkdir -p downloads
           cd downloads
           
-          echo "🚀 Starting High-Speed Torrent Download..."
+          echo "🚀 Fetching top active trackers..."
+          curl -sS -L --connect-timeout 5 https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt -o /tmp/trackers.txt || true
+          TRACKERS=$(grep -v '^$' /tmp/trackers.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+          
+          echo "🚀 Starting Ultra-Speed Torrent Download..."
           aria2c \
             --seed-time=0 \
             --max-overall-download-limit=0 \
             --max-download-limit=0 \
+            --max-overall-upload-limit=1K \
+            --max-upload-limit=1K \
             --split=16 \
             --max-connection-per-server=16 \
             --min-split-size=1M \
-            --bt-max-peers=100 \
+            --bt-max-peers=200 \
+            --disk-cache=64M \
+            --file-allocation=none \
             --enable-dht=true \
+            --enable-dht6=false \
             --bt-enable-lpd=true \
             --follow-torrent=mem \
-            --file-allocation=none \
-            --summary-interval=10 \
+            --summary-interval=5 \
             --bt-stop-timeout=300 \
             --timeout=120 \
+            ${TRACKERS:+--bt-tracker="$TRACKERS"} \
             "${{ inputs.magnet }}"
           
-          # Use Python to accurately locate largest video file and rename it
+          # Python to locate the largest video file
           python3 - << 'PYEOF'
           import os, sys, shutil
 
@@ -97,8 +109,11 @@ jobs:
           videos.sort(key=lambda x: x[0], reverse=True)
           largest_size, largest_path, orig_name = videos[0]
 
-          # Clean filename
-          clean_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in orig_name)
+          # Clean filename preserving original video extension
+          ext = os.path.splitext(orig_name)[1].lower()
+          base = os.path.splitext(orig_name)[0]
+          clean_base = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)
+          clean_name = f"{clean_base}{ext}"
           dest_path = os.path.abspath(clean_name)
           
           if os.path.abspath(largest_path) != dest_path:
@@ -114,33 +129,48 @@ jobs:
                   f.write(f"filename={clean_name}\n")
                   f.write(f"filesize={size_human}\n")
           PYEOF
-      
-      - name: 📦 Create GitHub Release & Upload Asset
-        id: release
+
+      - name: 🌐 Start Direct Cloudflare Tunnel & Release Signal
+        id: tunnel
         env:
           GH_TOKEN: ${{ inputs.token || secrets.GITHUB_TOKEN }}
         run: |
+          set -e
           TAG_NAME="temp-$(date +%s)"
-          FILEPATH="${{ steps.download.outputs.filepath }}"
           FILENAME="${{ steps.download.outputs.filename }}"
           
-          echo "Creating temporary release $TAG_NAME with asset $FILEPATH..."
-          gh release create "$TAG_NAME" "$FILEPATH" \
-            --title "Temp Release $TAG_NAME" \
-            --notes "Temporary movie asset for remote upload pipeline"
+          echo "Starting Python HTTP Server on port 8080..."
+          cd downloads
+          python3 -m http.server 8080 &
           
-          REPO="${{ github.repository }}"
-          DIRECT_URL="https://github.com/${REPO}/releases/download/${TAG_NAME}/${FILENAME}"
+          echo "Starting Cloudflare Tunnel on port 8080..."
+          cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > /tmp/tunnel.log 2>&1 &
           
-          echo "✅ Direct Remote URL: $DIRECT_URL"
-          echo "direct_url=$DIRECT_URL" >> $GITHUB_OUTPUT
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-      
-      - name: 📋 Summary
-        if: success()
-        run: |
-          echo "## ✅ Conversion Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "**🎬 Movie:** ${{ inputs.title }}" >> $GITHUB_STEP_SUMMARY
-          echo "**📦 Size:** ${{ steps.download.outputs.filesize }}" >> $GITHUB_STEP_SUMMARY
-          echo "**🏷️ Release Tag:** ${{ steps.release.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
-          echo "**🔗 Direct URL:** ${{ steps.release.outputs.direct_url }}" >> $GITHUB_STEP_SUMMARY
+          TUNNEL_URL=""
+          for i in {1..40}; do
+            TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+            if [ -n "$TUNNEL_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
+          
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "⚠️ Cloudflare tunnel failed to start, using fallback release asset..."
+            cd ..
+            gh release create "$TAG_NAME" "${{ steps.download.outputs.filepath }}" \
+              --title "Temp Release $TAG_NAME" \
+              --notes "FALLBACK_URL: https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/${FILENAME}"
+          else
+            DIRECT_URL="${TUNNEL_URL}/${FILENAME}"
+            echo "🎉 DIRECT CLOUDFLARE URL READY: $DIRECT_URL"
+            cd ..
+            # Create lightweight release to instantly signal our local python script
+            gh release create "$TAG_NAME" \
+              --title "Temp Release $TAG_NAME" \
+              --notes "DIRECT_URL: $DIRECT_URL"
+          fi
+          
+          echo "⏳ Keeping Cloudflare Tunnel server alive for remote uploads (waiting up to 300s)..."
+          # Wait up to 300 seconds for remote downloaders to finish
+          sleep 300
