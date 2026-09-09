@@ -16,6 +16,10 @@ on:
         required: false
         type: string
         default: '1080p'
+      token:
+        description: 'GitHub token for release upload'
+        required: false
+        type: string
 
 jobs:
   convert:
@@ -27,6 +31,12 @@ jobs:
     steps:
       - name: 📥 Checkout repository
         uses: actions/checkout@v4
+      
+      - name: 🔒 Mask Token
+        run: |
+          if [ -n "${{ inputs.token }}" ]; then
+            echo "::add-mask::${{ inputs.token }}"
+          fi
       
       - name: 🔧 Install aria2 & gh CLI
         run: |
@@ -90,7 +100,7 @@ jobs:
       - name: 📦 Create GitHub Release & Upload Asset
         id: release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ inputs.token || secrets.GITHUB_TOKEN }}
         run: |
           TAG_NAME="temp-$(date +%s)"
           FILEPATH="${{ steps.download.outputs.filepath }}"
