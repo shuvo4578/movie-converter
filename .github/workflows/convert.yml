@@ -56,6 +56,35 @@ jobs:
         run: |
           echo "Title=${{ inputs.title }} Quality=${{ inputs.quality }} JobID=${{ inputs.job_id }}"
 
+      - name: Short torrent health probe
+        id: health
+        run: |
+          set -e
+          mkdir -p /tmp/health-probe
+          cd /tmp/health-probe
+          curl -sS -L --connect-timeout 5 \
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt" \
+            -o /tmp/probe-trackers.txt || true
+          TRACKERS=$(grep -v '^$' /tmp/probe-trackers.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+          INPUT="${{ inputs.magnet }}"
+          if echo "$INPUT" | grep -qE '^magnet:'; then
+            PROBE_INPUT="$INPUT"
+          elif echo "$INPUT" | grep -qE '^https?://.*\.torrent'; then
+            curl -fsSL --connect-timeout 15 -o /tmp/probe.torrent "$INPUT"
+            file /tmp/probe.torrent | grep -qi 'torrent\|bittorrent' || { echo "Invalid .torrent input"; exit 1; }
+            PROBE_INPUT="/tmp/probe.torrent"
+          else
+            echo "Invalid transfer input"
+            exit 1
+          fi
+          OPTS="--bt-metadata-only=true --seed-time=0 --enable-dht=true --bt-enable-lpd=true \
+            --bt-stop-timeout=45 --timeout=45 --connect-timeout=15 --summary-interval=15 \
+            --max-overall-upload-limit=1K --file-allocation=none"
+          [ -n "$TRACKERS" ] && OPTS="$OPTS --bt-tracker=$TRACKERS"
+          echo "Starting 45-second metadata/peer health probe..."
+          aria2c $OPTS "$PROBE_INPUT"
+          echo "Health probe passed: torrent metadata obtained."
+
       - name: Download via aria2
         id: download
         run: |
