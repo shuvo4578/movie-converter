@@ -70,10 +70,10 @@ jobs:
             curl -sS -L --connect-timeout 10 -o /tmp/input.torrent "$INPUT" || true
             if file /tmp/input.torrent | grep -q -i 'torrent\|bittorrent'; then
               echo "✅ Valid .torrent file downloaded"
-              ARIA_INPUT="/tmp/input.torrent"
+              ARIA_INPUT="file:///tmp/input.torrent"
             else
-              echo "❌ Not a valid torrent file. Trying as magnet..."
-              ARIA_INPUT="$INPUT"
+              echo "❌ Not a valid torrent file. Aborting."
+              exit 1
             fi
           else
             echo "🔗 Magnet link detected"
