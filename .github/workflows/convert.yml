@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       magnet:
-        description: 'Magnet URI to convert'
+        description: 'Magnet URI or direct .torrent URL'
         required: true
         type: string
       title:
@@ -16,6 +16,10 @@ on:
         required: false
         default: '1080p'
         type: string
+      job_id:
+        description: 'Unique job ID for parallel run correlation'
+        required: true
+        type: string
       token:
         description: 'GitHub Personal Access Token'
         required: false
@@ -24,174 +28,153 @@ on:
 jobs:
   convert:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: write
       actions: write
-    
+
     steps:
-      - name: 📥 Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-      
-      - name: 🔒 Mask Token
+
+      - name: Mask token
         run: |
           if [ -n "${{ inputs.token }}" ]; then
             echo "::add-mask::${{ inputs.token }}"
           fi
 
-      - name: 🔧 Install aria2, gh CLI & cloudflared
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq aria2 curl python3
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared
+          curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
+            -o /usr/local/bin/cloudflared
           chmod +x /usr/local/bin/cloudflared
-      
-      - name: 📊 Display inputs
+
+      - name: Show inputs
         run: |
-          echo "🎬 Title: ${{ inputs.title }}"
-          echo "📺 Quality: ${{ inputs.quality }}"
-      
-      - name: ⬇️ Download torrent via aria2
+          echo "Title=${{ inputs.title }} Quality=${{ inputs.quality }} JobID=${{ inputs.job_id }}"
+
+      - name: Download via aria2
         id: download
         run: |
           set -e
           mkdir -p downloads
           cd downloads
-          
-          echo "🚀 Fetching top active trackers..."
-          curl -sS -L --connect-timeout 5 https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt -o /tmp/trackers.txt || true
+
+          curl -sS -L --connect-timeout 5 \
+            "https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt" \
+            -o /tmp/trackers.txt || true
           TRACKERS=$(grep -v '^$' /tmp/trackers.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-          
+
           INPUT="${{ inputs.magnet }}"
-          
-          # Detect if input is HTTP torrent link (not a magnet)
-          if echo "$INPUT" | grep -qE '^https?://'; then
-            echo "🌐 HTTP torrent link detected — downloading .torrent file first..."
-            curl -sS -L --connect-timeout 10 -o /tmp/input.torrent "$INPUT" || true
-            if file /tmp/input.torrent | grep -q -i 'torrent\|bittorrent'; then
-              echo "✅ Valid .torrent file downloaded"
-              ARIA_INPUT="file:///tmp/input.torrent"
+          USE_TORRENT_FILE=0
+
+          if echo "$INPUT" | grep -qE '^magnet:'; then
+            echo "Using magnet URI directly."
+            ARIA_INPUT="$INPUT"
+          elif echo "$INPUT" | grep -qE '^https?://.*\.torrent'; then
+            echo "Downloading .torrent metadata first..."
+            curl -sS -L --connect-timeout 15 -o /tmp/input.torrent "$INPUT"
+            if file /tmp/input.torrent | grep -qi 'torrent\|bittorrent'; then
+              echo "Valid .torrent confirmed."
+              USE_TORRENT_FILE=1
             else
-              echo "❌ Not a valid torrent file. Aborting."
+              echo "ERROR: not a valid torrent file."
+              head -c 200 /tmp/input.torrent || true
               exit 1
             fi
           else
-            echo "🔗 Magnet link detected"
-            ARIA_INPUT="$INPUT"
+            echo "ERROR: input is not a magnet URI or .torrent URL."
+            exit 1
           fi
-          
-          echo "🚀 Starting Ultra-Speed Torrent Download..."
-          aria2c \
-            --seed-time=0 \
-            --max-overall-download-limit=0 \
-            --max-download-limit=0 \
-            --max-overall-upload-limit=1K \
-            --max-upload-limit=1K \
-            --split=16 \
-            --max-connection-per-server=16 \
-            --min-split-size=1M \
-            --bt-max-peers=200 \
-            --disk-cache=64M \
-            --file-allocation=none \
-            --enable-dht=true \
-            --enable-dht6=false \
-            --bt-enable-lpd=true \
-            --follow-torrent=mem \
-            --summary-interval=5 \
-            --bt-stop-timeout=300 \
-            --timeout=120 \
-            ${TRACKERS:+--bt-tracker="$TRACKERS"} \
-            "$ARIA_INPUT"
-          
-          # Python to locate the largest video file
+
+          ARIA_COMMON_OPTS="--seed-time=0 --max-overall-download-limit=0 \
+            --max-download-limit=0 --max-overall-upload-limit=1K \
+            --split=16 --max-connection-per-server=16 --min-split-size=1M \
+            --bt-max-peers=200 --disk-cache=64M --file-allocation=none \
+            --enable-dht=true --bt-enable-lpd=true --follow-torrent=mem \
+            --summary-interval=30 --bt-stop-timeout=300 --timeout=120"
+
+          if [ -n "$TRACKERS" ]; then
+            ARIA_COMMON_OPTS="$ARIA_COMMON_OPTS --bt-tracker=$TRACKERS"
+          fi
+
+          if [ "$USE_TORRENT_FILE" = "1" ]; then
+            aria2c $ARIA_COMMON_OPTS /tmp/input.torrent
+          else
+            aria2c $ARIA_COMMON_OPTS "$ARIA_INPUT"
+          fi
+
           python3 - << 'PYEOF'
           import os, sys, shutil
-
           videos = []
           for root, dirs, files in os.walk("."):
               for f in files:
                   ext = os.path.splitext(f)[1].lower()
                   if ext in [".mp4", ".mkv", ".avi", ".ts", ".webm", ".m4v"]:
-                      full_path = os.path.join(root, f)
+                      full = os.path.join(root, f)
                       try:
-                          sz = os.path.getsize(full_path)
-                          if sz > 10 * 1024 * 1024:  # At least 10 MB
-                              videos.append((sz, full_path, f))
+                          sz = os.path.getsize(full)
+                          if sz > 10 * 1024 * 1024:
+                              videos.append((sz, full, f))
                       except OSError:
                           pass
-
           if not videos:
-              print("❌ No video media file found in torrent download!")
+              print("ERROR: No video file >= 10MB found!")
               sys.exit(1)
-
           videos.sort(key=lambda x: x[0], reverse=True)
-          largest_size, largest_path, orig_name = videos[0]
-
-          # Clean filename preserving original video extension
-          ext = os.path.splitext(orig_name)[1].lower()
-          base = os.path.splitext(orig_name)[0]
-          clean_base = "".join(c if c.isalnum() or c in "._-" else "_" for c in base)
-          clean_name = f"{clean_base}{ext}"
-          dest_path = os.path.abspath(clean_name)
-          
-          if os.path.abspath(largest_path) != dest_path:
-              shutil.move(largest_path, dest_path)
-
-          size_human = f"{largest_size / (1024*1024):.1f} MB" if largest_size < 1024*1024*1024 else f"{largest_size / (1024*1024*1024):.2f} GB"
-          print(f"✅ Downloaded Video: {clean_name} ({size_human})")
-
-          gh_out = os.environ.get("GITHUB_OUTPUT")
-          if gh_out:
-              with open(gh_out, "a") as f:
-                  f.write(f"filepath=downloads/{clean_name}\n")
-                  f.write(f"filename={clean_name}\n")
-                  f.write(f"filesize={size_human}\n")
+          sz, path, name = videos[0]
+          ext = os.path.splitext(name)[1].lower()
+          base = os.path.splitext(name)[0]
+          clean = "".join(c if c.isalnum() or c in "._-" else "_" for c in base) + ext
+          dest = os.path.abspath(clean)
+          if os.path.abspath(path) != dest:
+              shutil.move(path, dest)
+          szh = f"{sz/(1024*1024):.1f}MB" if sz < 1024**3 else f"{sz/(1024**3):.2f}GB"
+          print(f"Video: {clean} ({szh})")
+          gh = os.environ.get("GITHUB_OUTPUT")
+          if gh:
+              open(gh, "a").write(f"filepath=downloads/{clean}\nfilename={clean}\nfilesize={szh}\n")
           PYEOF
 
-      - name: 🌐 Start Direct Cloudflare Tunnel & Release Signal
+      - name: Start Cloudflare Tunnel and signal release
         id: tunnel
         env:
           GH_TOKEN: ${{ inputs.token || secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          TAG_NAME="temp-$(date +%s)"
+          JOB_ID="${{ inputs.job_id }}"
+          TAG_NAME="temp-${JOB_ID}"
           FILENAME="${{ steps.download.outputs.filename }}"
-          
-          echo "Starting Python HTTP Server on port 8080..."
-          cd downloads
-          python3 -m http.server 8080 &
-          
-          echo "Starting Cloudflare Tunnel on port 8080..."
+          REPO="${{ github.repository }}"
+
+          cd downloads && python3 -m http.server 8080 & cd ..
           cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > /tmp/tunnel.log 2>&1 &
-          
+
           TUNNEL_URL=""
-          for i in {1..40}; do
+          for i in $(seq 1 40); do
             TUNNEL_URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
-            if [ -n "$TUNNEL_URL" ]; then
-              break
-            fi
+            [ -n "$TUNNEL_URL" ] && break
             sleep 1
           done
-          
+
+          printf 'JOB_ID=%s\nQUALITY=%s\nTITLE=%s\n' \
+            "$JOB_ID" "${{ inputs.quality }}" "${{ inputs.title }}" > /tmp/notes.txt
+
           if [ -z "$TUNNEL_URL" ]; then
-            echo "⚠️ Cloudflare tunnel failed to start, using fallback release asset..."
-            cd ..
+            echo "Tunnel failed — fallback to release asset."
+            ASSET_URL="https://github.com/${REPO}/releases/download/${TAG_NAME}/${FILENAME}"
+            printf 'FALLBACK_ASSET=true\nDIRECT_URL=%s\n' "$ASSET_URL" >> /tmp/notes.txt
             gh release create "$TAG_NAME" "${{ steps.download.outputs.filepath }}" \
-              --title "Temp Release $TAG_NAME" \
-              --notes "FALLBACK_URL: https://github.com/${{ github.repository }}/releases/download/${TAG_NAME}/${FILENAME}"
+              --title "Temp-${TAG_NAME}" --notes "$(cat /tmp/notes.txt)"
           else
             DIRECT_URL="${TUNNEL_URL}/${FILENAME}"
-            echo "🎉 DIRECT CLOUDFLARE URL READY: $DIRECT_URL"
-            cd ..
-            # Create lightweight release to instantly signal our local python script
+            echo "Cloudflare URL = $DIRECT_URL"
+            printf 'DIRECT_URL=%s\n' "$DIRECT_URL" >> /tmp/notes.txt
             gh release create "$TAG_NAME" \
-              --title "Temp Release $TAG_NAME" \
-              --notes "DIRECT_URL: $DIRECT_URL"
+              --title "Temp-${TAG_NAME}" --notes "$(cat /tmp/notes.txt)"
           fi
-          
-          echo "⏳ Tunnel is live. Waiting for cancel signal from local uploader..."
-          # Loop indefinitely — local pipeline will cancel this run via GitHub API
-          # when all 3 platform uploads complete. Job timeout-minutes: 30 is safety net.
-          while true; do
-            sleep 10
-          done
+
+          echo "Waiting for cancel signal from local uploader..."
+          while true; do sleep 10; done
