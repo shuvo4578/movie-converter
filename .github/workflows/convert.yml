@@ -62,6 +62,24 @@ jobs:
           curl -sS -L --connect-timeout 5 https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt -o /tmp/trackers.txt || true
           TRACKERS=$(grep -v '^$' /tmp/trackers.txt 2>/dev/null | tr '\n' ',' | sed 's/,$//')
           
+          INPUT="${{ inputs.magnet }}"
+          
+          # Detect if input is HTTP torrent link (not a magnet)
+          if echo "$INPUT" | grep -qE '^https?://'; then
+            echo "🌐 HTTP torrent link detected — downloading .torrent file first..."
+            curl -sS -L --connect-timeout 10 -o /tmp/input.torrent "$INPUT" || true
+            if file /tmp/input.torrent | grep -q -i 'torrent\|bittorrent'; then
+              echo "✅ Valid .torrent file downloaded"
+              ARIA_INPUT="/tmp/input.torrent"
+            else
+              echo "❌ Not a valid torrent file. Trying as magnet..."
+              ARIA_INPUT="$INPUT"
+            fi
+          else
+            echo "🔗 Magnet link detected"
+            ARIA_INPUT="$INPUT"
+          fi
+          
           echo "🚀 Starting Ultra-Speed Torrent Download..."
           aria2c \
             --seed-time=0 \
@@ -83,7 +101,7 @@ jobs:
             --bt-stop-timeout=300 \
             --timeout=120 \
             ${TRACKERS:+--bt-tracker="$TRACKERS"} \
-            "${{ inputs.magnet }}"
+            "$ARIA_INPUT"
           
           # Python to locate the largest video file
           python3 - << 'PYEOF'
@@ -171,6 +189,9 @@ jobs:
               --notes "DIRECT_URL: $DIRECT_URL"
           fi
           
-          echo "⏳ Keeping Cloudflare Tunnel server alive for remote uploads (waiting up to 300s)..."
-          # Wait up to 300 seconds for remote downloaders to finish
-          sleep 300
+          echo "⏳ Tunnel is live. Waiting for cancel signal from local uploader..."
+          # Loop indefinitely — local pipeline will cancel this run via GitHub API
+          # when all 3 platform uploads complete. Job timeout-minutes: 30 is safety net.
+          while true; do
+            sleep 10
+          done
